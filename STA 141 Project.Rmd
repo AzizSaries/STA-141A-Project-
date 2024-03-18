@@ -1,0 +1,420 @@
+---
+title: "STA 141A Project"
+author: "Aziz Saries"
+date: "2024-01-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(caret) 
+library(ROCR)
+library(glmnet)
+library(readr)
+library(caret) 
+library(glmnet)
+library(pROC)
+library(xgboost)
+```
+
+# Abstract
+
+The purpose of the study by Steinmetz et al. (2019) was to observe the feedback type of a mouse using the neural activity of the mouse. The mice had to perform a task where visual stimuli of varying contrast could appear on the left side, right side, both sides, or neither. They earned a reward by turning a wheel which had higher contrast. Similarly, they were rewarded for not turning the wheel if neither stimulus was present. We will only use a subset of this data from this study, and it will only contain data from 18 of the 39 sessions and 4 of the 10 mice. The objective of this project will be to create a predictive model using this neural activity data to predict the feedback type of mice accurately. The feedback type was whether the mice were able to accurately turn the wheel to the side, which truly had the higher contrast. The performance of this predictive model will be evaluated on two sets of 100 trials randomly selected from Session 1 and Session 18.
+
+# Introduction
+
+We will be using seven predictor variables to predict the feedback type of our test data mice. They are brain area, contrast left, contrast right, the date, the mouse name, spikes, and time. The brain area is the area of the brain that the neuron fired during the respective trial, and contrast left and right are the contrast of the left and right stimuli, respectively. The date and time were the respective dates the trial was being conducted and the time that had elapsed from when the stimuli were presented. The mouse name was the name of the various mice (Cori, Forssmann, Hench, or Lederberg). The spikes variable is the number of neural firings that were measured for each neuron in its respective time bin, where a time bin is simply a defined interval where the firing will be measured. Having these time bins will help make our data more discrete and make it easier to identify patterns in the neuron activity by linking this neuron firing with a distinct time slot.
+
+```{r, echo = FALSE}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('C:/Users/Az1zs/OneDrive/Desktop/STA 141A Project/Data/session',i,'.rds',sep=''))
+  
+}
+```
+
+```{r, echo = FALSE}
+get_trial_data <- function(session_data, session_id, trial_id) {
+  spikes <- session_data[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))) {
+    disp("value missing")
+  }
+
+  trial_tibble <- tibble("neuron_spike" = rowSums(spikes)) %>%
+    add_column("brain_area" = session_data[[session_id]]$brain_area) %>%
+    group_by(brain_area) %>%
+    summarize(region_sum_spike = sum(neuron_spike), region_count = n(), region_mean_spike = mean(neuron_spike)) %>%
+    ungroup() %>%
+    add_column("trial_id" = trial_id) %>%
+    add_column("contrast_left" = session_data[[session_id]]$contrast_left[trial_id]) %>%
+    add_column("contrast_right" = session_data[[session_id]]$contrast_right[trial_id]) %>%
+    add_column("feedback_type" = session_data[[session_id]]$feedback_type[trial_id])
+
+  return(trial_tibble)
+}
+
+```
+
+```{r,echo=FALSE}
+
+get_session_data <- function(session_data, session_id) {
+  n_trial <- length(session_data[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial) {
+    trial_tibble <- get_trial_data(session_data, session_id, trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  session_tibble <- do.call(rbind, trial_list)
+  session_tibble <- session_tibble %>%
+    add_column("mouse_name" = session_data[[session_id]]$mouse_name) %>%
+    add_column("date_exp" = session_data[[session_id]]$date_exp) %>%
+    add_column("session_id" = session_id)
+
+  return(session_tibble)
+}
+
+```
+
+```{r,echo=FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+full_tibble <- do.call(rbind, session_list)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+full_tibble$contrast_diff <- abs(full_tibble$contrast_left-full_tibble$contrast_right)
+```
+
+# Exploratory Data Analysis
+
+We will first explore the data to understand and evaluate if there is any apparent heterogeneity among the data with regards to sessions 1 and 18 since that is where our test data is coming from. As we can see from the table directly below, which includes the respective session ID and number of trials, we can observe that the number of trials varies greatly across the respective trials, so we will need to standardize these variables to ensure we can compare these numbers across the sessions. We will first look at the number of neurons, the number of unique brain areas, the number of average spikes, and the average success rate across the sessions. I chose to evaluate the number of neurons because I believe it is essential to ensure that the mice during sessions 1 and 18 didn't have a disproportionally large amount of neurons firing when compared to the other session, as this could hint towards those sessions being too different from the other 16. We will also observe the number of unique brain areas to observe if the brain areas firing during the same sessions are similar to ensure that the mice are giving roughly homogeneous responses to the stimuli across all of the sessions or to observe whether specific areas of the brain are linked to biasing a particular outcome. Additionally, we will look at the success rate (which will be calculated as the number of times when feedback type is a success divided by the number of trials in that session) to account for the varying number of trials in a session whilst also comparing the successes that were obtained during each of the trials. We will be evaluating these variables of interest to ensure once again that there are no apparent differences between sessions 1 and 18 from the other 16 sessions, which could worsen our predictive model due to the inclusion of the other 16 sessions.
+
+```{r, echo = FALSE}
+num_trials_session <- numeric(length(session))
+
+for(i in 1:length(session)) {
+  num_trials_session[i] <- length(session[[i]]$spks)
+}
+
+df_num_trials_session <- data.frame(
+  Session = 1:18,
+  "Number of Trials" = num_trials_session
+)
+
+df_num_trials_session
+```
+
+```{r, echo = FALSE}
+num_neurons_session <- numeric(length(session))
+
+for(i in 1:length(session)) {
+  num_neurons_session[i] <- nrow(session[[i]]$spks[[1]])
+}
+
+df_neurons_session <- data.frame(
+  Session = 1:18,
+  "Neuron Count" = num_neurons_session
+)
+df_neurons_session
+```
+
+```{r, echo = FALSE}
+ggplot(df_neurons_session, aes(x = Session, y = num_neurons_session)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  theme_minimal() +
+  labs(x = "Session Number", y = "Neuron Count", title = "Neuron Count Across Sessions") 
+
+neurons_1_18 = c(734, 1090)
+neuron_other = c(1070, 619, 1769, 1077, 1169, 584, 1157, 788, 1172, 857, 698, 983, 756, 743, 474, 565)
+
+neuron_result <- t.test(neurons_1_18, neuron_other, alternative = "two.sided", var.equal = FALSE)
+
+neuron_result_2 = wilcox.test(neurons_1_18, neuron_other, alternative = "two.sided", exact = NULL, correct = TRUE)
+```
+
+```{r, echo = FALSE}
+num_brain_area_session <- numeric(length(session))
+
+for(i in 1:length(session)) {
+  num_brain_area_session[i] <- length(unique(session[[i]]$brain_area))
+}
+
+df_brain_areas <- data.frame(
+  Session = 1:18,
+  "Unique Brain Areas" = num_brain_area_session
+)
+df_brain_areas
+```
+
+```{r, echo = FALSE}
+ggplot(df_brain_areas, aes(x = Session, y = num_brain_area_session)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(x = "Session Number", y = "Number of Brain Areas", title = "Number of Unique Brain Areas by Session") 
+
+brain_area_1_18 = c(8, 10)
+brain_area_other = c(5, 11, 11, 10, 5, 8, 15, 12, 13, 6, 12, 15, 10, 8, 6, 6)
+
+
+```
+
+```{r, echo = FALSE}
+avg_spike_per_session <- numeric(length(session))
+
+for (i in 1:length(session)) {
+  session_spikes <- session[[i]]$spks  
+  total_spikes_per_trial <- numeric(length(session_spikes))
+  
+  for (j in 1:length(session_spikes)) {
+    trial_data <- session_spikes[[j]]  
+    total_spikes_per_trial[j] <- mean(rowSums(trial_data))
+  }
+  
+  avg_spike_per_session[i] <- mean(total_spikes_per_trial)
+}
+
+df_avg_spike_per_session <- data.frame(
+  Session = 1:18,
+  AverageSpikes = round(avg_spike_per_session, digits = 3)
+)
+
+df_avg_spike_per_session
+
+```
+
+```{r, echo = FALSE}
+ggplot(df_avg_spike_per_session, aes(x = Session, y = AverageSpikes)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(x = "Session Number", y = "Average Number of Spikes", title = "Average Number of Spikes Across Sessions")
+
+avg_spikes_1_18 = c(1.540, 1.096)
+avg_spikes_other = c(1.266, 2.234, 0.842, 1.116, 0.663, 1.415, 1.656, 1.587, 1.188, 1.250, 1.663, 2.458, 1.007, 1.464, 1.050, 1.166)
+
+avg_spikes_result <- t.test(avg_spikes_1_18, avg_spikes_other, alternative = "two.sided", var.equal = FALSE)
+
+avg_spikes_result_2 = wilcox.test(avg_spikes_1_18, avg_spikes_other, alternative = "two.sided", exact = NULL, correct = TRUE)
+
+```
+
+```{r, echo = FALSE}
+success_rate_per_session <- numeric(length(session))
+
+for (i in 1:length(session)) {
+  feedback_types <- session[[i]]$feedback_type
+  num_successes <- sum(feedback_types == 1)
+  success_rate_per_session[i] <- num_successes / length(feedback_types)
+}
+
+df_success_rate <- data.frame(
+  Session = 1:18,
+  SuccessRate = round(success_rate_per_session, digits = 3)  
+)
+df_success_rate
+```
+
+```{r, echo = FALSE}
+ggplot(df_success_rate, aes(x = Session, y = SuccessRate)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(x = "Session Number", y = "Success Rate", title = "Average Success Rate Across Sessions") 
+
+success_rate_1_18 = c(0.605, 0.806)
+success_rate_other = c(0.633, 0.662, 0.667, 0.661, 0.741, 0.671, 0.644, 0.685, 0.620, 0.795, 0.738, 0.797, 0.694, 0.765, 0.718, 0.830)
+
+success_rate_result <- t.test(success_rate_1_18, success_rate_other, alternative = "two.sided", var.equal = FALSE)
+
+success_rate_result_2 = wilcox.test(success_rate_1_18, success_rate_other, alternative = "two.sided", exact = NULL, correct = TRUE)
+
+```
+
+When observing the four various histograms, which contain the number of neurons, number of unique brain areas, average number of spikes, and success rates across all 18 sessions, we can visually see that the bars on the histograms are fairly homogeneous. We will test this rigorously through the use of two-sample t-tests and Wilcoxon rank-sum tests to ensure that these values that correspond to the 1st and 18th sessions are similar to those from the other 16 sessions to ensure that when we are creating our predictive model using data from the other 16 sessions won't worsen the performance. As you can see in the outputs appendix, which is attached on the last page, all eight statistical tests which are used to compare two samples concluded that there was significant enough evidence to conclude that, under any reasonable $\alpha$, we can conclude that there was no significant difference between the two groups. Therefore, going on with this report, we will assume that all 18 samples are homogeneous.
+
+Since our histogram for unique brain areas only observed if there was a unique brain area and not what brain area, we will create a visualization to observe if certain areas are consistently observed across all 18 sessions or if there is any variability.
+
+```{r,echo=FALSE}
+ggplot(full_tibble, aes(x = session_id, y = brain_area)) +
+  geom_point() +
+  labs(x = "Session ID", y = "Brain Area") +
+  scale_x_continuous(breaks = unique(full_tibble$session_id)) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 5, angle = 20, hjust = 1))  
+```
+
+We can observe in the plot that there does not appear to be brain areas that are uniquely active in specific sessions which further supports the idea that there is no apparent affect that the session id has on the brain activity or lack of brain activity of the mice.
+
+```{r,echo=FALSE}
+binename <- paste0("bin", as.character(1:40))
+
+get_trial_functional_data <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trial_bin_average) <- binename
+  trial_tibble  = as_tibble(trial_bin_average)%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trial_id])
+  
+  trial_tibble
+}
+get_session_functional_data <- function(session_id){
+  n_trial <- length(session[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_functional_data(session_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trial_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+```{r, echo = FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- abs(full_functional_tibble$contrast_left-full_functional_tibble$contrast_right)
+
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+```
+
+# Data Integration
+We summarize these contrast_left and contrast_right variables as contrast_diff in order to observe slightly more about our data. The contrast difference will be calculated as the absolute value of the difference between the contrast_left and contrast_right. This allows us to possibly reduce the complexity of our data slightly while maintaining the magnitude of the difference between the contrasts due to the absolute value. This is because we will observe if there is a difference between contrasts in isolation and not necessarily whether these differences are primarily coming from the left or the right. By focusing on the magnitude of the difference, we will be able to directly observe how the degree of contrast, regardless of its direction, influences the success rate of the mice's responses in the trials.
+
+```{r, echo = FALSE}
+full_functional_tibble %>% group_by(contrast_diff) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+```
+
+```{r, echo = FALSE}
+anova <- aov(success ~ as.factor(contrast_diff), data = full_functional_tibble)
+summary(anova)
+```
+
+By simply observing the table, we can observe that outside of the "0.50" contrast difference, it appears that the contrast difference has a positive correlation with the rate of success. Therefore, in order to rigorously observe if this is the case, we will conduct a one-way ANOVA test to determine if the success rate is independent of the contrast_difference. As we can observe in the ANOVA table, the p-value is roughly zero, which allows us to conclude there is sufficient evidence that the contrast difference does have an impact on the rate of success. Therefore, this looks like an important piece to include in our predictive model.
+
+```{r, echo = FALSE}
+features = full_functional_tibble[,1:40]
+scaled_features <- scale(features)
+pca_result <- prcomp(scaled_features)
+pc_df <- as.data.frame(pca_result$x)
+pc_df$session_id <- full_functional_tibble$session_id
+pc_df$mouse_name <- full_functional_tibble$mouse_name
+```
+
+
+```{r, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = session_id)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+```
+
+We will now apply PCA to attempt to observe any key features among the 18 sessions. However since, as we can see in the plot below, there is not a stark difference between the sessions in the context of PC1 and PC2. This lack of distinct separation between the session colors indicates there is no pattern that can distinguish these sessions based on the 1st and 2nd principal components. Therefore, this supports the idea that the 18 sessions are similar enough to pool data from all 18 sessions to create our predictive model for the test data from sessions 1 and 18.
+
+```{r,echo=FALSE}
+predictive_feature <- c("session_id","trial_id","contrast_right","contrast_left", "contrast_diff")
+head(full_functional_tibble[predictive_feature])
+
+predictive_dat <- full_functional_tibble[predictive_feature]
+predictive_dat$trial_id <- as.numeric(predictive_dat$trial_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_dat)
+
+```
+
+```{r, echo = FALSE}
+set.seed(1) 
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+
+# Predictive Modeling
+
+For our first predictive model, we will use the XGBoost algorithm. We will be using this because we have a large data set. Since we were able to conclude that all 18 sessions are similar enough, we are able to pool data from all 18 sessions to create our predictive model, and XGBoost is great at handling large data sets. Additionally, we assume that there will be some multicollinearity between our predictors since, at the very least, one of our variables, the contrast difference, is a linear combination of the contrast left and contrast right variables. XGBoost is an algorithm that can handle this interaction between predictors so that is another benefit. We will be comparing this model to a generalized linear model that doesn't contain this contrast difference variable since a generalized linear model isn't suited to handle multicollinearity. We will be using AUROC as our measure of performance. AUROC is a measure that goes from 0 to 1, and the closer the number is to 1, the better your model is at predicting the binary outcome.
+
+```{r, echo = FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+```
+
+```{r, echo = FALSE}
+prediction1 <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(prediction1 > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+```
+
+```{r, echo = FALSE}
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+```
+
+```{r, echo = FALSE}
+auroc <- roc(test_label, prediction1)
+auroc
+```
+# Appendix 
+Number of Neurons Two-Sample t-test and Wilcoxon rank sum test
+```{r}
+print(neuron_result)
+
+print(neuron_result_2)
+```
+
+Number of Unique Brain Areas Two-Sample t-test and Wilcoxon rank sum test
+```{r}
+brain_area_result <- t.test(brain_area_1_18, brain_area_other, alternative = "two.sided", var.equal = FALSE)
+
+brain_area_result_2 = wilcox.test(brain_area_1_18, brain_area_other, alternative = "two.sided", exact = NULL, correct = TRUE)
+
+print(brain_area_result)
+
+print(brain_area_result_2)
+```
+
+Average Number of Spikes Two-Sample t-test and Wilcoxon rank sum test 
+```{r}
+print(avg_spikes_result)
+
+print(avg_spikes_result_2)
+```
+
+Success Rate Two-Sample t-test and Wilcoxon rank sum test
+```{r}
+print(success_rate_result)
+
+print(success_rate_result_2)
+```
+
+```{r, echo = FALSE}
+test=list()
+for(i in 1:2){
+  test[[i]]=readRDS(paste('C:/Users/Az1zs/OneDrive/Desktop/STA 141A Project/test',i,'.rds',sep=''))
+  
+}
+
+test_session_list = list()
+for (session_id in 1:length(test)) {
+  test_session_list[[session_id]] <- get_session_data(test, session_id)
+}
+
+```
+
+
